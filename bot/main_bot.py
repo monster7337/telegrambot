@@ -8,10 +8,11 @@ from aiogram.filters import StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import suppress
 from aiogram.exceptions import TelegramAPIError
-
+import os
 # --- Настройки ---
 BOT_TOKEN = "7562714456:AAHLG6zZxjUduK8Koh0-N_Z0fOtKRNGcq8Y"
-API_BASE_URL = "http://127.0.0.1:8000" 
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+api_client = httpx.AsyncClient(base_url=API_URL)
 
 # --- Константы статусов ---
 STATUS_APPROVED = "✅ Одобрена, поиск водителя"
@@ -19,7 +20,6 @@ STATUS_DECLINED = "❌ Отклонена диспетчером"
 STATUS_COMPLETED = "🏁 Выполнена"
 
 # --- Инициализация ---
-api_client = httpx.AsyncClient(base_url=API_BASE_URL)
 dp = Dispatcher()
 bot = Bot(token=BOT_TOKEN)
 
