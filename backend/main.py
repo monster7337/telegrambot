@@ -1,88 +1,130 @@
+
 import os
 import datetime
-from typing import List, Optional, Dict, Generator
-from sqlalchemy import BigInteger
-from fastapi import FastAPI, HTTPException, Depends, status
-from pydantic import BaseModel, Field
+from enum import Enum
+from typing import List, Optional, Generator
 
+from fastapi import FastAPI, HTTPException, Depends, status
+from pydantic import BaseModel
 from sqlalchemy import (
     create_engine,
     Column,
     Integer,
+    BigInteger,
     String,
-    JSON,
     DateTime,
+    Boolean,
+    Text,
+    JSON,
     ForeignKey,
-    select,
 )
-from sqlalchemy.orm import (
-    declarative_base,
-    relationship,
-    sessionmaker,
-    Session,
-)
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+# --- Database setup ------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
-
 Base = declarative_base()
 
-# Константы статусов
-STATUS_NEW = "\U0001F195 Новая заявка"  # 🆕
-STATUS_PENDING_APPROVAL = "\u23F3 На проверке у диспетчера"  # ⏳
-STATUS_APPROVED_BY_DISPATCHER = "\u2705 Одобрена, поиск водителя"  # ✅
-STATUS_DECLINED_BY_DISPATCHER = "\u274C Отклонена диспетчером"  # ❌
-STATUS_ASSIGNED_TO_DRIVER = "\U0001F69A Водитель найден"  # 🚚
-STATUS_PICKED = "\U0001F504 Заказ забран"  # 🔄
-STATUS_DELIVERING = "\U0001F69A В пути"  # 🚚 
-STATUS_COMPLETED = "\U0001F3C1 Выполнена"  # 🏁
+# --- Enumerations --------------------------------------------------------
+
+class UserRole(str, Enum):
+    customer = "customer"
+    dispatcher = "dispatcher"
+    driver = "driver"
 
 
-# SQLAlchemy модели
+class OrderStatus(str, Enum):
+    created = "created"
+    planning = "planning"
+    driver_assigned = "driver_assigned"
+    in_progress = "in_progress"
+    completed = "completed"
+    archived = "archived"
+
+# --- SQLAlchemy models ---------------------------------------------------
 
 class UserDB(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    role = Column(String, index=True, nullable=False)
+    role = Column(String, nullable=False)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
 
+    # One‑to‑many: user -> orders created
     orders = relationship(
         "OrderDB", back_populates="customer", foreign_keys="OrderDB.customer_id"
     )
+    # One‑to‑many: user -> orders delivered
     deliveries = relationship(
         "OrderDB", back_populates="driver", foreign_keys="OrderDB.driver_id"
     )
+
+
+class ItemDB(Base):
+    __tablename__ = "items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    weight = Column(Integer, nullable=False)
+    count = Column(Integer, nullable=False)
+    size = Column(String, nullable=False)
+    documents = Column(Text)
+    get_from = Column(JSON, nullable=False)      # {"name":"...", "phone": "...", "address": "..."}
+    deliver_to = Column(JSON, nullable=False)    # same structure
+    need_payment = Column(Boolean, default=False)
+    lead_time = Column(DateTime, nullable=False)
+    comments = Column(Text)
+
+    # One‑to‑one back‑ref from OrderDB
+    order = relationship("OrderDB", back_populates="item", uselist=False)
 
 
 class OrderDB(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, index=True)
-
-    customer_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
-    customer_telegram_id = Column(BigInteger, index=True, nullable=False)
+    customer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     driver_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    item_id = Column(Integer, ForeignKey("items.id"), unique=True, nullable=False)
 
-    status = Column(String, default=STATUS_NEW, index=True)
-    payload = Column(JSON, nullable=False)
+    status = Column(String, default=OrderStatus.created.value, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
     customer = relationship("UserDB", foreign_keys=[customer_id], back_populates="orders")
     driver = relationship("UserDB", foreign_keys=[driver_id], back_populates="deliveries")
+    item = relationship("ItemDB", back_populates="order", uselist=False)
 
+# --- Pydantic schemas ----------------------------------------------------
 
-# Pydantic схемы (response models)
-class User(BaseModel):
-    id: int
-    telegram_id: int
-    role: str
+class ContactInfo(BaseModel):
     name: str
     phone: str
+    address: Optional[str] = None
+
+class Item(BaseModel):
+    id: int
+    name: str
+    weight: int
+    count: int
+    size: str
+    documents: Optional[str] = None
+    get_from: ContactInfo
+    deliver_to: ContactInfo
+    need_payment: bool
+    lead_time: datetime.datetime
+    comments: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
+class ItemCreate(Item):
+    id: Optional[int] = None
 
     class Config:
         orm_mode = True
@@ -91,25 +133,35 @@ class User(BaseModel):
 class Order(BaseModel):
     id: int
     customer_id: int
-    customer_telegram_id: int
-    driver_id: Optional[int]
-    status: str
-    payload: Dict
+    driver_id: Optional[int] = None
+    status: OrderStatus
     created_at: datetime.datetime
+    item: Item
 
     class Config:
         orm_mode = True
 
 
-# FastAPI и зависимость для сессии
-app = FastAPI(title="Logistics Bot Backend (PostgreSQL)")
+class User(BaseModel):
+    id: int
+    telegram_id: int
+    role: UserRole
+    name: str
+    phone: str
 
+    class Config:
+        orm_mode = True
+
+# --- FastAPI initialisation ---------------------------------------------
+
+app = FastAPI(title="Logistics Bot Backend (new schema)")
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Создаём таблицы (если они ещё не созданы). В проде лучше Alembic."""
+    """Create tables automatically on first start (dev only)."""
     Base.metadata.create_all(bind=engine)
 
+# --- Dependency ---------------------------------------------------------
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
@@ -118,8 +170,13 @@ def get_db() -> Generator[Session, None, None]:
     finally:
         db.close()
 
+# --- User endpoints -----------------------------------------------------
 
-# Endpoints для пользователей
+@app.get("/users/", response_model=List[User])
+def get_all_users(db: Session = Depends(get_db)):
+    return db.query(UserDB).all()
+
+
 @app.get("/users/{user_id}", response_model=User)
 def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
     user = db.get(UserDB, user_id)
@@ -128,36 +185,52 @@ def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
     return user
 
 
-@app.get("/users/by_telegram/{telegram_id}", response_model=Optional[User])
-def get_user_by_telegram_id(telegram_id: int, db: Session = Depends(get_db)):
-    return (
-        db.execute(select(UserDB).where(UserDB.telegram_id == telegram_id))
-        .scalars()
-        .first()
-    )
+@app.get("/users/by_telegram/{telegram_id}", response_model=User)
+def get_user_by_telegram(telegram_id: int, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.telegram_id == telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# --- Order endpoints ----------------------------------------------------
+
+class ItemPayload(BaseModel):
+    """Incoming payload for order creation (without id)."""
+    name: str
+    weight: int
+    count: int
+    size: str
+    documents: Optional[str] = None
+    get_from: ContactInfo
+    deliver_to: ContactInfo
+    need_payment: bool
+    lead_time: datetime.datetime
+    comments: Optional[str] = None
 
 
-@app.get("/users/by_role/{role}", response_model=List[User])
-def get_users_by_role(role: str, db: Session = Depends(get_db)):
-    return db.execute(select(UserDB).where(UserDB.role == role)).scalars().all()
-
-
-# Endpoints для заявок
 @app.post("/orders/", response_model=Order, status_code=status.HTTP_201_CREATED)
-def create_order(customer_telegram_id: int, payload: Dict, db: Session = Depends(get_db)):
-    customer: UserDB | None = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == customer_telegram_id))
-        .scalars()
-        .first()
+def create_order(
+    customer_telegram_id: int,
+    item: ItemPayload,
+    db: Session = Depends(get_db),
+):
+    """Create new order together with its Item."""
+    customer = (
+        db.query(UserDB).filter(UserDB.telegram_id == customer_telegram_id).first()
     )
-    if not customer or customer.role != "customer":
-        raise HTTPException(status_code=403, detail="Только заказчик может создавать заявки")
+    if not customer or customer.role != UserRole.customer.value:
+        raise HTTPException(
+            status_code=403, detail="Only customers can create orders"
+        )
+
+    item_db = ItemDB(**item.dict())
+    db.add(item_db)
+    db.flush()  # to get generated item id
 
     order_db = OrderDB(
         customer_id=customer.id,
-        customer_telegram_id=customer.telegram_id,
-        payload=payload,
-        status=STATUS_PENDING_APPROVAL,
+        item_id=item_db.id,
+        status=OrderStatus.created.value,
     )
     db.add(order_db)
     db.commit()
@@ -165,147 +238,83 @@ def create_order(customer_telegram_id: int, payload: Dict, db: Session = Depends
     return order_db
 
 
-@app.get("/orders/customer/{telegram_id}", response_model=List[Order])
-def get_customer_orders(telegram_id: int, db: Session = Depends(get_db)):
-    customer = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == telegram_id))
-        .scalars()
-        .first()
-    )
-    if not customer:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
-    return (
-        db.execute(select(OrderDB).where(OrderDB.customer_id == customer.id))
-        .scalars()
-        .all()
-    )
+from fastapi import Query
 
+@app.get("/orders/", response_model=List[Order])
+def get_orders(status: Optional[OrderStatus] = Query(None), db: Session = Depends(get_db)):
+    query = db.query(OrderDB)
+    if status:
+        query = query.filter(OrderDB.status == status.value)
+    return query.all()
 
-@app.get("/orders/pending_approval", response_model=List[Order])
-def get_pending_orders_for_dispatcher(db: Session = Depends(get_db)):
-    return (
-        db.execute(select(OrderDB).where(OrderDB.status == STATUS_PENDING_APPROVAL))
-        .scalars()
-        .all()
-    )
-
-
-@app.get("/orders/driver/available", response_model=List[Order])
-def get_available_orders(db: Session = Depends(get_db)):
-    return (
-        db.execute(select(OrderDB).where(OrderDB.status == STATUS_APPROVED_BY_DISPATCHER))
-        .scalars()
-        .all()
-    )
 
 
 @app.post("/orders/{order_id}/assign/{driver_telegram_id}", response_model=Order)
 def assign_driver(order_id: int, driver_telegram_id: int, db: Session = Depends(get_db)):
-    order: OrderDB | None = db.get(OrderDB, order_id)
-    driver: UserDB | None = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == driver_telegram_id))
-        .scalars()
-        .first()
+    order = db.get(OrderDB, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    driver = (
+        db.query(UserDB).filter(UserDB.telegram_id == driver_telegram_id).first()
     )
-    if not order or not driver or driver.role != "driver":
-        raise HTTPException(status_code=404, detail="Заявка или водитель не найдены")
+    if not driver or driver.role != UserRole.driver.value:
+        raise HTTPException(status_code=404, detail="Driver not found")
 
     order.driver_id = driver.id
-    order.status = STATUS_ASSIGNED_TO_DRIVER
+    order.status = OrderStatus.driver_assigned.value
     db.commit()
     db.refresh(order)
     return order
 
 
+@app.post("/orders/{order_id}/status", response_model=Order)
+def update_order_status(order_id: int, status: OrderStatus, db: Session = Depends(get_db)):
+    order = db.get(OrderDB, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order.status = status.value
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.get("/orders/customer/{telegram_id}", response_model=List[Order])
+def get_customer_orders(telegram_id: int, db: Session = Depends(get_db)):
+    customer = (
+        db.query(UserDB).filter(UserDB.telegram_id == telegram_id).first()
+    )
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return db.query(OrderDB).filter(OrderDB.customer_id == customer.id).all()
+
+
 @app.get("/orders/driver/{telegram_id}/active", response_model=List[Order])
 def get_driver_active_orders(telegram_id: int, db: Session = Depends(get_db)):
-    driver = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == telegram_id))
-        .scalars()
-        .first()
-    )
-    if not driver or driver.role != "driver":
-        raise HTTPException(status_code=403, detail="Пользователь не водитель")
+    driver = db.query(UserDB).filter(UserDB.telegram_id == telegram_id).first()
+    if not driver or driver.role != UserRole.driver.value:
+        raise HTTPException(status_code=403, detail="Not a driver")
 
-    active_statuses = [STATUS_ASSIGNED_TO_DRIVER, STATUS_PICKED, STATUS_DELIVERING]
+    active_statuses = [
+        OrderStatus.driver_assigned.value,
+        OrderStatus.in_progress.value,
+    ]
     return (
-        db.execute(
-            select(OrderDB).where(
-                OrderDB.driver_id == driver.id, OrderDB.status.in_(active_statuses)
-            )
-        )
-        .scalars()
+        db.query(OrderDB)
+        .filter(OrderDB.driver_id == driver.id, OrderDB.status.in_(active_statuses))
         .all()
     )
 
 
 @app.get("/orders/driver/{telegram_id}/history", response_model=List[Order])
 def get_driver_order_history(telegram_id: int, db: Session = Depends(get_db)):
-    driver = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == telegram_id))
-        .scalars()
-        .first()
-    )
-    if not driver or driver.role != "driver":
-        raise HTTPException(status_code=403, detail="Пользователь не водитель")
+    driver = db.query(UserDB).filter(UserDB.telegram_id == telegram_id).first()
+    if not driver or driver.role != UserRole.driver.value:
+        raise HTTPException(status_code=403, detail="Not a driver")
 
     return (
-        db.execute(
-            select(OrderDB).where(
-                OrderDB.driver_id == driver.id, OrderDB.status == STATUS_COMPLETED
-            )
-        )
-        .scalars()
+        db.query(OrderDB)
+        .filter(OrderDB.driver_id == driver.id, OrderDB.status == OrderStatus.completed.value)
         .all()
     )
-
-
-@app.post("/orders/{order_id}/status", response_model=Order)
-def update_order_status(order_id: int, status: str, db: Session = Depends(get_db)):
-    order: OrderDB | None = db.get(OrderDB, order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заявка не найдена")
-
-    order.status = status
-    db.commit()
-    db.refresh(order)
-    return order
-
-
-@app.get("/orders/{order_id}/customer_phone")
-def get_customer_phone(order_id: int, db: Session = Depends(get_db)):
-    order: OrderDB | None = db.get(OrderDB, order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Заявка не найдена")
-
-    customer: UserDB | None = db.get(UserDB, order.customer_id)
-    if not customer:
-        raise HTTPException(status_code=404, detail="Заказчик не найден")
-
-    return {"phone": customer.phone}
-
-
-@app.get("/orders/{order_id}", response_model=Order)
-def get_order_by_id(order_id: int, db: Session = Depends(get_db)):
-    order = db.get(OrderDB, order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    return order
-
-
-# Утилита для быстрого наполнения тестовыми данными
-
-TEST_USERS = [
-    dict(id=1, telegram_id=7198487225, role="customer", name="Тестовый Заказчик", phone="+79001234567"),
-    dict(id=2, telegram_id=7809176251, role="driver", name="Тестовый Водитель", phone="+79007654321"),
-    dict(id=3, telegram_id=661832899, role="dispatcher", name="Главный Диспетчер", phone="+79001112233"),
-]
-
-
-@app.on_event("startup")
-def _seed_data() -> None:
-    """Добавляем тестовых пользователей, если БД пуста (idempotent)."""
-    with SessionLocal() as db:
-        if db.execute(select(UserDB.id)).first() is None:
-            db.add_all(UserDB(**u) for u in TEST_USERS)
-            db.commit()
