@@ -4,6 +4,8 @@ from typing import List, Optional, Dict, Generator
 from sqlalchemy import BigInteger
 from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel, Field
+import json
+from fastapi.encoders import jsonable_encoder
 
 from sqlalchemy import (
     create_engine,
@@ -99,7 +101,32 @@ class Order(BaseModel):
 
     class Config:
         orm_mode = True
+# --- Схема payload для создания заявки --- #
 
+class ContactInfo(BaseModel):
+    name: str
+    phone: str
+    address: Optional[str] = None
+
+
+class CargoInfo(BaseModel):
+    name: str
+    weight: int
+    count: int
+    size: str
+
+
+class PayloadSchema(BaseModel):
+    cargo: CargoInfo
+    documents: str
+    get_from: ContactInfo
+    pickup_contact: ContactInfo
+    docs_contact: Optional[ContactInfo] = None
+    deliver_to: ContactInfo
+    address_from: str
+    need_payment: bool
+    lead_time: datetime.datetime
+    extra_info: Optional[str] = None
 
 # FastAPI и зависимость для сессии
 app = FastAPI(title="Logistics Bot Backend (PostgreSQL)")
@@ -107,7 +134,7 @@ app = FastAPI(title="Logistics Bot Backend (PostgreSQL)")
 
 @app.on_event("startup")
 def _startup() -> None:
-    """Создаём таблицы (если они ещё не созданы). В проде лучше Alembic."""
+    """Создаём таблицы (если они ещё не созданы)"""
     Base.metadata.create_all(bind=engine)
 
 
@@ -119,7 +146,11 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-# Endpoints для пользователей
+@app.get("/users/", response_model=List[User])
+def get_all_users(db: Session = Depends(get_db)):
+    return db.execute(select(UserDB)).scalars().all()
+
+# Получить пользователя по ID
 @app.get("/users/{user_id}", response_model=User)
 def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
     user = db.get(UserDB, user_id)
@@ -127,7 +158,7 @@ def get_user_by_id(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
-
+# Получить пользователя по Telegram ID
 @app.get("/users/by_telegram/{telegram_id}", response_model=Optional[User])
 def get_user_by_telegram_id(telegram_id: int, db: Session = Depends(get_db)):
     return (
@@ -136,34 +167,30 @@ def get_user_by_telegram_id(telegram_id: int, db: Session = Depends(get_db)):
         .first()
     )
 
-
+# Получить всех пользователей по роли
 @app.get("/users/by_role/{role}", response_model=List[User])
 def get_users_by_role(role: str, db: Session = Depends(get_db)):
     return db.execute(select(UserDB).where(UserDB.role == role)).scalars().all()
-
-
 # Endpoints для заявок
 @app.post("/orders/", response_model=Order, status_code=status.HTTP_201_CREATED)
-def create_order(customer_telegram_id: int, payload: Dict, db: Session = Depends(get_db)):
-    customer: UserDB | None = (
-        db.execute(select(UserDB).where(UserDB.telegram_id == customer_telegram_id))
-        .scalars()
-        .first()
-    )
+def create_order(customer_telegram_id: int, payload: PayloadSchema, db: Session = Depends(get_db)):
+    customer = db.execute(select(UserDB).where(UserDB.telegram_id == customer_telegram_id)).scalars().first()
     if not customer or customer.role != "customer":
         raise HTTPException(status_code=403, detail="Только заказчик может создавать заявки")
+
+    # 🔧 Гарантируем сериализацию вложенных моделей и datetime
+    encoded_payload = jsonable_encoder(payload.dict())
 
     order_db = OrderDB(
         customer_id=customer.id,
         customer_telegram_id=customer.telegram_id,
-        payload=payload,
+        payload=encoded_payload,
         status=STATUS_PENDING_APPROVAL,
     )
     db.add(order_db)
     db.commit()
     db.refresh(order_db)
     return order_db
-
 
 @app.get("/orders/customer/{telegram_id}", response_model=List[Order])
 def get_customer_orders(telegram_id: int, db: Session = Depends(get_db)):
