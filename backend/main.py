@@ -129,19 +129,6 @@ class ItemCreate(Item):
     class Config:
         orm_mode = True
 
-
-class Order(BaseModel):
-    id: int
-    customer_id: int
-    driver_id: Optional[int] = None
-    status: OrderStatus
-    created_at: datetime.datetime
-    item: Item
-
-    class Config:
-        orm_mode = True
-
-
 class User(BaseModel):
     id: int
     telegram_id: int
@@ -151,6 +138,20 @@ class User(BaseModel):
 
     class Config:
         orm_mode = True
+class Order(BaseModel):
+    id: int
+    customer_id: int
+    driver_id: Optional[int] = None
+    status: OrderStatus
+    created_at: datetime.datetime
+    item: Item
+    customer: User
+
+    class Config:
+        orm_mode = True
+
+
+
 
 # --- FastAPI initialisation ---------------------------------------------
 
@@ -268,9 +269,11 @@ def assign_driver(order_id: int, driver_telegram_id: int, db: Session = Depends(
     return order
 
 
+from sqlalchemy.orm import joinedload
+
 @app.post("/orders/{order_id}/status", response_model=Order)
 def update_order_status(order_id: int, status: OrderStatus, db: Session = Depends(get_db)):
-    order = db.get(OrderDB, order_id)
+    order = db.query(OrderDB).options(joinedload(OrderDB.customer)).get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -278,7 +281,6 @@ def update_order_status(order_id: int, status: OrderStatus, db: Session = Depend
     db.commit()
     db.refresh(order)
     return order
-
 
 @app.get("/orders/customer/{telegram_id}", response_model=List[Order])
 def get_customer_orders(telegram_id: int, db: Session = Depends(get_db)):
